@@ -3387,17 +3387,53 @@ _ostree_sysroot_run_in_deployment (int deployment_dfd, const char *const *bwrap_
 }
 
 #ifdef HAVE_SELINUX
+static gboolean
+sysroot_prune_selinux_tmp_dirs (int deployment_dfd, GCancellable *cancellable, GError **error)
+{
+  GLNX_AUTO_PREFIX_ERROR ("Pruning stale SELinux policy store state", error);
+
+  g_auto (GLnxDirFdIterator) dfd_iter = {
+    0,
+  };
+  if (!glnx_dirfd_iterator_init_at (deployment_dfd, "etc/selinux", TRUE, &dfd_iter, error))
+    return FALSE;
+
+  while (TRUE)
+    {
+      struct dirent *dent;
+      struct stat stbuf;
+
+      if (!glnx_dirfd_iterator_next_dent_ensure_dtype (&dfd_iter, &dent, cancellable, error))
+        return FALSE;
+      if (dent == NULL)
+        break;
+
+      if (dent->d_type != DT_DIR)
+        continue;
+
+      if (!glnx_fstatat_allow_noent (dfd_iter.fd, "tmp", &stbuf, AT_SYMLINK_NOFOLLOW, error))
+        return FALSE;
+      if (errno != 0)
+        continue;
+
+      ot_journal_print (LOG_INFO, "Removing stale tmp dir for SELinux policy store %s",
+                        dent->d_name);
+      if (!glnx_shutil_rm_rf_at (dfd_iter.fd, "tmp", cancellable, error))
+        return glnx_prefix_error (error, "Removing tmp dir of policy store %s", dent->d_name);
+    }
+
+  return TRUE;
+}
+
 /*
  * Run semodule to check if the module content changed after merging /etc
  * and rebuild the policy if needed.
  */
 static gboolean
-sysroot_finalize_selinux_policy (int deployment_dfd, GError **error)
+sysroot_finalize_selinux_policy (int deployment_dfd, GCancellable *cancellable, GError **error)
 {
   GLNX_AUTO_PREFIX_ERROR ("Finalizing SELinux policy", error);
   struct stat stbuf;
-  gint exit_status;
-  g_autofree gchar *stdout = NULL;
 
   if (!glnx_fstatat_allow_noent (deployment_dfd, "etc/selinux/config", &stbuf, AT_SYMLINK_NOFOLLOW,
                                  error))
@@ -3407,16 +3443,35 @@ sysroot_finalize_selinux_policy (int deployment_dfd, GError **error)
   if (errno != 0)
     return TRUE;
 
+  g_autoptr (GError) local_error = NULL;
+
+  if (!sysroot_prune_selinux_tmp_dirs (deployment_dfd, cancellable, &local_error))
+    {
+      ot_journal_print (LOG_WARNING, "Failed to prune stale SELinux policy state: %s",
+                        local_error->message);
+      g_printerr ("Warning: failed to prune stale SELinux policy state: %s\n",
+                  local_error->message);
+      g_clear_error (&local_error);
+    }
+
+  gint exit_status;
+  g_autofree gchar *stdout = NULL;
+
   /*
    * Skip the SELinux policy refresh if the --refresh
    * flag is not supported by semodule.
    */
   static const gchar *const SEMODULE_HELP_ARGV[] = { "semodule", "--help", NULL };
   if (!_ostree_sysroot_run_in_deployment (deployment_dfd, NULL, SEMODULE_HELP_ARGV, &exit_status,
-                                          &stdout, error))
-    return FALSE;
-  if (!g_spawn_check_exit_status (exit_status, error))
-    return glnx_prefix_error (error, "failed to run semodule");
+                                          &stdout, &local_error)
+      || !g_spawn_check_exit_status (exit_status, &local_error))
+    {
+      ot_journal_print (LOG_WARNING, "Failed to run semodule, skipping SELinux policy refresh: %s",
+                        local_error->message);
+      g_printerr ("Warning: failed to run semodule, skipping SELinux policy refresh: %s\n",
+                  local_error->message);
+      return TRUE;
+    }
   if (!strstr (stdout, "--refresh"))
     {
       ot_journal_print (LOG_INFO, "semodule does not have --refresh");
@@ -3427,13 +3482,23 @@ sysroot_finalize_selinux_policy (int deployment_dfd, GError **error)
 
   ot_journal_print (LOG_INFO, "Refreshing SELinux policy");
   guint64 start_msec = g_get_monotonic_time () / 1000;
-  if (!_ostree_sysroot_run_in_deployment (deployment_dfd, NULL, SEMODULE_REBUILD_ARGV, &exit_status,
-                                          NULL, error))
-    return FALSE;
+  gboolean spawned = _ostree_sysroot_run_in_deployment (deployment_dfd, NULL, SEMODULE_REBUILD_ARGV,
+                                                        &exit_status, NULL, &local_error);
   guint64 end_msec = g_get_monotonic_time () / 1000;
   ot_journal_print (LOG_INFO, "Refreshed SELinux policy in %" G_GUINT64_FORMAT " ms",
                     end_msec - start_msec);
-  return g_spawn_check_exit_status (exit_status, error);
+
+  if (spawned && g_spawn_check_exit_status (exit_status, &local_error))
+    return TRUE;
+
+  g_assert (local_error);
+  ot_journal_print (LOG_WARNING,
+                    "SELinux policy refresh failed; finalizing deployment with previously built"
+                    " binary policy: %s",
+                    local_error->message);
+  g_printerr ("Warning: SELinux policy refresh failed, finalizing deployment anyway: %s\n",
+              local_error->message);
+  return TRUE;
 }
 #endif /* HAVE_SELINUX */
 
@@ -3515,7 +3580,7 @@ sysroot_finalize_deployment (OstreeSysroot *self, OstreeDeployment *deployment,
         return FALSE;
 
 #ifdef HAVE_SELINUX
-      if (!sysroot_finalize_selinux_policy (deployment_dfd, error))
+      if (!sysroot_finalize_selinux_policy (deployment_dfd, cancellable, error))
         return FALSE;
 #endif /* HAVE_SELINUX */
     }
